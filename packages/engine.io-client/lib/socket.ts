@@ -258,6 +258,16 @@ export interface SocketOptions {
    * @default []
    */
   protocols?: string | string[];
+
+  /**
+   * The default maximum time (in milliseconds) to wait for the ack of a message sent with `sendWithAck()`.
+   * Can be overridden on a per-message basis with the `timeout` option of `sendWithAck()`.
+   *
+   * A value of `0` (the default) disables the timeout.
+   *
+   * @default 0
+   */
+  ackTimeout?: number;
 }
 
 type TransportCtor = { new (o: any): Transport };
@@ -297,6 +307,80 @@ type SocketState = "opening" | "open" | "closing" | "closed";
 
 export interface WriteOptions {
   compress?: boolean;
+}
+
+/**
+ * A middleware applied to outgoing messages sent with {@link SocketWithoutUpgrade#sendWithAck}.
+ *
+ * It receives the current message payload and may:
+ *
+ * - return a value (or a promise of a value) to replace the payload,
+ * - return `undefined` to leave the payload unchanged,
+ * - throw (or reject) to reject the message, in which case it is not sent and no ack id is consumed.
+ */
+export type AckMiddleware = (
+  data: RawData,
+) => RawData | void | Promise<RawData | void>;
+
+/**
+ * Callback invoked once a message sent with {@link SocketWithoutUpgrade#sendWithAck} completes.
+ *
+ * @param err - `null` upon success, an `Error` describing the failure otherwise (rejection, timeout or disconnection)
+ * @param response - the payload of the ack, upon success
+ */
+export type AckCallback = (err: Error | null, response?: RawData) => void;
+
+export interface SendWithAckOptions {
+  /**
+   * The maximum time (in milliseconds) to wait for the ack of this specific message. It overrides the
+   * `ackTimeout` socket option for this message only, without mutating it.
+   */
+  timeout?: number;
+}
+
+interface PendingAck {
+  callback: AckCallback;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * The marker used to wrap the payload of a message which expects an ack.
+ */
+const ACK_REQUEST_MARKER = "__eioAck";
+/**
+ * The marker used to wrap the payload of an ack.
+ */
+const ACK_RESPONSE_MARKER = "__eioAckReply";
+const ACK_REQUEST_PREFIX = `{"${ACK_REQUEST_MARKER}":`;
+const ACK_RESPONSE_PREFIX = `{"${ACK_RESPONSE_MARKER}":`;
+
+/**
+ * The upper bound (exclusive) of the ack id space. Ids wrap back to 0 once exhausted, skipping ids which are still
+ * waiting for an ack.
+ */
+const MAX_ACK_ID = 0x7fffffff;
+
+function encodeAckRequest(id: number, data: RawData): string {
+  return JSON.stringify({ [ACK_REQUEST_MARKER]: id, data });
+}
+
+function decodeAckEnvelope(
+  data: RawData,
+  prefix: string,
+  marker: string,
+): { id: number; data: RawData } | null {
+  if (typeof data !== "string" || !data.startsWith(prefix)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(data);
+    if (parsed && typeof parsed[marker] === "number") {
+      return { id: parsed[marker], data: parsed.data };
+    }
+  } catch (e) {
+    // not a valid ack envelope
+  }
+  return null;
 }
 
 /**
@@ -349,6 +433,14 @@ export class SocketWithoutUpgrade extends Emitter<
    */
   private _pingTimeoutTime = Infinity;
   private clearTimeoutFn: typeof clearTimeout;
+  /**
+   * The acks which are still waiting for a response, indexed by their ack id. Ids are only shared within the
+   * lifetime of a single connection: the map is cleared when the connection closes, so a new connection (even one
+   * reusing the same session id) never inherits pending acks.
+   */
+  private _pendingAcks: Map<number, PendingAck> = new Map();
+  private _nextAckId = 0;
+  private readonly _ackMiddlewares: AckMiddleware[] = [];
   private readonly _beforeunloadEventListener: () => void;
   private readonly _offlineEventListener: () => void;
 
@@ -624,6 +716,15 @@ export class SocketWithoutUpgrade extends Emitter<
           break;
 
         case "message":
+          const ack = decodeAckEnvelope(
+            packet.data,
+            ACK_RESPONSE_PREFIX,
+            ACK_RESPONSE_MARKER,
+          );
+          if (ack) {
+            this._onAckResponse(ack.id, ack.data);
+            break;
+          }
           this.emitReserved("data", packet.data);
           this.emitReserved("message", packet.data);
           break;
@@ -793,6 +894,189 @@ export class SocketWithoutUpgrade extends Emitter<
   }
 
   /**
+   * Registers a middleware applied to outgoing messages sent with {@link SocketWithoutUpgrade#sendWithAck}.
+   *
+   * Middlewares run in registration order: if one rejects the message (by throwing or returning a rejected
+   * promise), the remaining middlewares are skipped, the message is not sent and no ack id is consumed.
+   *
+   * @param fn - the middleware
+   * @return {Socket} for chaining.
+   */
+  public use(fn: AckMiddleware) {
+    this._ackMiddlewares.push(fn);
+    return this;
+  }
+
+  /**
+   * Sends a message which expects an ack from the remote side.
+   *
+   * The message only completes once the remote side sends back an ack with the same ack id:
+   *
+   * - if the ack does not arrive within the given timeout, the callback is called with a timeout error,
+   * - if the connection closes before the ack arrives, the callback is called with a disconnection error,
+   * - an ack arriving after the message has already completed (timeout, disconnection or a previous ack) is
+   *   silently discarded.
+   *
+   * @param {String} msg - message.
+   * @param {Object} options - options, including a per-message `timeout` (in ms) which does not mutate the
+   * `ackTimeout` socket option.
+   * @param {Function} fn - callback invoked upon completion. If omitted, a promise is returned instead.
+   * @return {Socket|Promise} for chaining, or a promise if no callback is provided.
+   */
+  public sendWithAck(
+    msg: RawData,
+    options?: SendWithAckOptions | number,
+    fn?: AckCallback,
+  ): SocketWithoutUpgrade | Promise<RawData> {
+    if ("function" === typeof options) {
+      fn = options as unknown as AckCallback;
+      options = undefined;
+    }
+    if (typeof options === "number") {
+      options = { timeout: options };
+    }
+    if (fn) {
+      this._sendWithAck(msg, options || {}, fn);
+      return this;
+    }
+    return new Promise((resolve, reject) => {
+      this._sendWithAck(msg, options || {}, (err, response) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(response);
+        }
+      });
+    });
+  }
+
+  private _sendWithAck(
+    msg: RawData,
+    options: SendWithAckOptions,
+    callback: AckCallback,
+  ) {
+    if ("closing" === this.readyState || "closed" === this.readyState) {
+      nextTick(() => {
+        callback(new Error("socket is closed"));
+      }, this.setTimeoutFn);
+      return;
+    }
+    this._runAckMiddlewares(msg, 0)
+      .then((data) => {
+        if ("closing" === this.readyState || "closed" === this.readyState) {
+          callback(new Error("socket is closed"));
+          return;
+        }
+        // the ack id is only allocated once all middlewares have accepted the message, so that rejected
+        // messages never consume an id
+        const id = this._allocateAckId();
+        const pending: PendingAck = { callback };
+        // the timeout is specified per message and falls back to the `ackTimeout` socket option, without
+        // mutating it
+        const timeout =
+          options.timeout !== undefined
+            ? options.timeout
+            : this.opts.ackTimeout || 0;
+        if (timeout > 0) {
+          pending.timer = this.setTimeoutFn(() => {
+            this._pendingAcks.delete(id);
+            callback(new Error("operation has timed out"));
+          }, timeout);
+          if (this.opts.autoUnref) {
+            (pending.timer as NodeJS.Timeout).unref();
+          }
+        }
+        this._pendingAcks.set(id, pending);
+        this._sendPacket("message", encodeAckRequest(id, data));
+      })
+      .catch((err) => {
+        // a middleware which throws (or rejects) turns into a rejection of the message: it is not sent, no
+        // ack id is consumed and the connection is left untouched
+        debug("message rejected by middleware: %s", err);
+        callback(
+          err instanceof Error
+            ? err
+            : new Error("message rejected by middleware: " + String(err)),
+        );
+      });
+  }
+
+  private _runAckMiddlewares(
+    data: RawData,
+    index: number,
+  ): Promise<RawData> {
+    if (index >= this._ackMiddlewares.length) {
+      return Promise.resolve(data);
+    }
+    return Promise.resolve()
+      .then(() => this._ackMiddlewares[index](data))
+      .then((result) =>
+        this._runAckMiddlewares(result === undefined ? data : result, index + 1),
+      );
+  }
+
+  /**
+   * Allocates the next available ack id for this connection, wrapping back to 0 once the id space is exhausted
+   * and skipping ids which are still waiting for an ack.
+   *
+   * @private
+   */
+  private _allocateAckId(): number {
+    let id = this._nextAckId;
+    while (this._pendingAcks.has(id)) {
+      id = (id + 1) % MAX_ACK_ID;
+      if (id === this._nextAckId) {
+        throw new Error("no ack id available");
+      }
+    }
+    this._nextAckId = (id + 1) % MAX_ACK_ID;
+    return id;
+  }
+
+  /**
+   * Handles an incoming ack. Only the first ack for a given id is taken into account; subsequent ones (or acks
+   * arriving after a timeout) are silently discarded, without triggering the middlewares.
+   *
+   * @private
+   */
+  private _onAckResponse(id: number, data: RawData) {
+    const pending = this._pendingAcks.get(id);
+    if (!pending) {
+      debug("discarding ack with unknown id %d", id);
+      return;
+    }
+    this._pendingAcks.delete(id);
+    if (pending.timer) {
+      this.clearTimeoutFn(pending.timer);
+    }
+    pending.callback(null, data);
+  }
+
+  /**
+   * Fails all pending acks because the connection was closed. This happens before the session id is reset, so
+   * that the error can reference the connection the acks belonged to, and before any new connection could reuse
+   * the same identifier.
+   *
+   * @private
+   */
+  private _failPendingAcksOnClose() {
+    if (!this._pendingAcks.size) {
+      return;
+    }
+    const err = new Error(
+      `disconnected before the ack was received (connection id: ${this.id})`,
+    );
+    for (const pending of this._pendingAcks.values()) {
+      if (pending.timer) {
+        this.clearTimeoutFn(pending.timer);
+      }
+      pending.callback(err);
+    }
+    this._pendingAcks.clear();
+    this._nextAckId = 0;
+  }
+
+  /**
    * Sends a packet.
    *
    * @param {String} type - packet type.
@@ -913,6 +1197,10 @@ export class SocketWithoutUpgrade extends Emitter<
       "closing" === this.readyState
     ) {
       debug('socket close with reason: "%s"', reason);
+
+      // fail all pending acks before anything else, so that a new connection reusing the same session id
+      // never inherits them (and so that the error can reference the current connection id)
+      this._failPendingAcksOnClose();
 
       // clear timers
       this.clearTimeoutFn(this._pingTimeoutTimer);
