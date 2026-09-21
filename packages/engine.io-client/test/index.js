@@ -8,6 +8,7 @@ if (env.browser) {
 }
 
 require("./engine.io-client");
+require("./ack-lifecycle");
 require("./socket");
 require("./transport");
 require("./connection");

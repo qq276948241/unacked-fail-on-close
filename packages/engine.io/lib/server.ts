@@ -128,6 +128,13 @@ export interface ServerOptions {
    */
   initialPacket?: any;
   /**
+   * whether the server automatically replies to messages which expect an ack (sent with the client
+   * `sendWithAck()` method). When set to `false`, the user is responsible for sending the ack back.
+   *
+   * @default true
+   */
+  autoAck?: boolean;
+  /**
    * configuration of the cookie that contains the client sid to send as part of handshake response headers. This cookie
    * might be used for sticky-session. Defaults to not sending any cookie.
    * @default false

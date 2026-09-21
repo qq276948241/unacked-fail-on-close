@@ -9,6 +9,40 @@ import type transports from "./transports";
 
 const debug = debugModule("engine:socket");
 
+/**
+ * The marker used by the client to wrap the payload of a message which expects an ack.
+ */
+const ACK_REQUEST_MARKER = "__eioAck";
+/**
+ * The marker used to wrap the payload of an ack.
+ */
+const ACK_RESPONSE_MARKER = "__eioAckReply";
+
+/**
+ * Decodes an ack request envelope.
+ *
+ * @param data - the received payload
+ * @return the ack id and the wrapped payload, or `null` if the payload is not an ack request
+ * @private
+ */
+function decodeAckRequest(data: RawData): { id: number; data: RawData } | null {
+  if (
+    typeof data !== "string" ||
+    !data.startsWith(`{"${ACK_REQUEST_MARKER}":`)
+  ) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(data);
+    if (parsed && typeof parsed[ACK_REQUEST_MARKER] === "number") {
+      return { id: parsed[ACK_REQUEST_MARKER], data: parsed.data };
+    }
+  } catch (e) {
+    // not a valid ack envelope
+  }
+  return null;
+}
+
 export interface SendOptions {
   compress?: boolean;
 }
@@ -186,6 +220,23 @@ export class Socket extends EventEmitter {
         break;
 
       case "message":
+        const ackRequest = decodeAckRequest(packet.data);
+        if (ackRequest) {
+          // the message expects an ack: unless the server opts out, reply with an ack envelope carrying the
+          // same id, so that the client can match it with the pending request
+          if (this.server.opts.autoAck !== false) {
+            this.sendPacket(
+              "message",
+              JSON.stringify({
+                [ACK_RESPONSE_MARKER]: ackRequest.id,
+                data: ackRequest.data,
+              }),
+            );
+          }
+          this.emit("data", ackRequest.data);
+          this.emit("message", ackRequest.data);
+          break;
+        }
         this.emit("data", packet.data);
         this.emit("message", packet.data);
         break;

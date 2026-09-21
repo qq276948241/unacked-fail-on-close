@@ -2,7 +2,10 @@ import { Socket } from "./socket.js";
 
 export { Socket };
 export {
+  AckCallback,
+  AckMiddleware,
   HandshakeData,
+  SendWithAckOptions,
   SocketOptions,
   SocketReservedEvents,
   SocketWithoutUpgrade,
